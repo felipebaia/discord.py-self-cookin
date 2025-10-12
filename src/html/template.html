@@ -1,0 +1,425 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Discord Monitor - Localhost</title>
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #2c2f33;
+            color: #ffffff;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background-color: #7289da;
+            border-radius: 8px;
+        }
+        .status {
+            padding: 10px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            text-align: center;
+        }
+        .status.connected { background-color: #43b581; }
+        .status.disconnected { background-color: #f04747; }
+        .messages {
+            max-height: 70vh;
+            overflow-y: auto;
+            border: 1px solid #40444b;
+            border-radius: 8px;
+            padding: 10px;
+            background-color: #36393f;
+        }
+        .message {
+            margin-bottom: 15px;
+            padding: 10px;
+            border-left: 4px solid #7289da;
+            background-color: #40444b;
+            border-radius: 0 8px 8px 0;
+        }
+        .message.edit { border-left-color: #ffa500; }
+        .message.delete { border-left-color: #f04747; }
+        .message-header {
+            font-size: 12px;
+            color: #b9bbbe;
+            margin-bottom: 5px;
+        }
+        .message-content {
+            font-size: 14px;
+            line-height: 1.4;
+        }
+        .author {
+            font-weight: bold;
+            color: #7289da;
+        }
+        .timestamp {
+            float: right;
+            color: #72767d;
+        }
+        .guild-info {
+            color: #b9bbbe;
+            font-size: 11px;
+        }
+        .controls {
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        button {
+            background-color: #7289da;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 0 10px;
+        }
+        button:hover {
+            background-color: #5b6eae;
+        }
+        
+        /* Estilos para as abas */
+        .tabs {
+            display: flex;
+            background-color: #36393f;
+            border-radius: 8px 8px 0 0;
+            margin-bottom: 0;
+            border: 1px solid #40444b;
+            border-bottom: none;
+        }
+        
+        .tab {
+            padding: 12px 20px;
+            cursor: pointer;
+            background-color: #36393f;
+            border: none;
+            color: #b9bbbe;
+            border-right: 1px solid #40444b;
+            transition: all 0.3s ease;
+            flex: 1;
+            text-align: center;
+        }
+        
+        .tab:first-child {
+            border-radius: 8px 0 0 0;
+        }
+        
+        .tab:last-child {
+            border-right: none;
+            border-radius: 0 8px 0 0;
+        }
+        
+        .tab.active {
+            background-color: #7289da;
+            color: #ffffff;
+        }
+        
+        .tab:hover:not(.active) {
+            background-color: #40444b;
+            color: #ffffff;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .channel-info {
+            font-size: 12px;
+            opacity: 0.8;
+            margin-top: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔍 Discord Monitor Dashboard</h1>
+        <p>Monitoramento em tempo real das mensagens capturadas</p>
+    </div>
+
+    <div id="status" class="status disconnected">
+        🔴 Aguardando conexão do self-bot...
+    </div>
+
+    <div class="controls">
+        <button onclick="clearMessages()">🗑️ Limpar Mensagens</button>
+        <button onclick="toggleAutoScroll()">📜 Auto-scroll: <span id="autoscroll-status">ON</span></button>
+        <button onclick="location.reload()">🔄 Recarregar</button>
+    </div>
+
+    <!-- Container das abas -->
+    <div class="tabs" id="tabs">
+        <!-- As abas serão criadas dinamicamente pelo JavaScript -->
+    </div>
+    
+    <!-- Container do conteúdo das abas -->
+    <div id="tab-contents">
+        <!-- O conteúdo das abas será criado dinamicamente -->
+    </div>
+
+    <script>
+        const socket = io();
+        let autoScroll = true;
+        let lastMessageTime = null;
+        let channels = new Map(); // Armazena informações dos canais
+        let activeChannel = null;
+        let messagesByChannel = new Map(); // Armazena mensagens por canal
+
+        socket.on('connect', function() {
+            console.log('Conectado ao servidor');
+            // Solicita informações dos canais configurados
+            fetch('/channels')
+                .then(response => response.json())
+                .then(data => {
+                    initializeTabs(data.channels);
+                })
+                .catch(error => {
+                    console.error('Erro ao obter canais:', error);
+                    // Fallback: cria uma aba genérica
+                    initializeTabs([{id: 'all', name: 'Todos os Canais', guild_name: 'Geral'}]);
+                });
+        });
+
+        socket.on('new_message', function(data) {
+            console.log('Nova mensagem recebida:', data);
+            updateStatus('connected');
+            addMessage(data);
+        });
+
+        socket.on('disconnect', function() {
+            console.log('Desconectado do servidor');
+            updateStatus('disconnected');
+        });
+
+        function initializeTabs(channelData) {
+            const tabsContainer = document.getElementById('tabs');
+            const contentsContainer = document.getElementById('tab-contents');
+            
+            // Limpa conteúdo existente
+            tabsContainer.innerHTML = '';
+            contentsContainer.innerHTML = '';
+            
+            // Adiciona aba "Todos" primeiro
+            channels.set('all', {
+                id: 'all',
+                name: 'Todos os Canais',
+                guild_name: 'Geral'
+            });
+            messagesByChannel.set('all', []);
+            
+            // Adiciona canais configurados
+            channelData.forEach(channel => {
+                channels.set(channel.id.toString(), channel);
+                messagesByChannel.set(channel.id.toString(), []);
+            });
+            
+            // Cria as abas
+            let isFirst = true;
+            channels.forEach((channel, channelId) => {
+                createTab(channelId, channel, isFirst);
+                createTabContent(channelId, isFirst);
+                if (isFirst) {
+                    activeChannel = channelId;
+                    isFirst = false;
+                }
+            });
+        }
+
+        function createTab(channelId, channel, isActive = false) {
+            const tabsContainer = document.getElementById('tabs');
+            const tab = document.createElement('div');
+            tab.className = `tab ${isActive ? 'active' : ''}`;
+            tab.setAttribute('data-channel', channelId);
+            tab.onclick = () => switchTab(channelId);
+            
+            if (channelId === 'all') {
+                tab.innerHTML = `
+                    <div>📋 ${channel.name}</div>
+                    <div class="channel-info">Todos os canais monitorados</div>
+                `;
+            } else {
+                tab.innerHTML = `
+                    <div>💬 ${channel.name || `Canal ${channelId}`}</div>
+                    <div class="channel-info">${channel.guild_name || 'Discord'}</div>
+                `;
+            }
+            
+            tabsContainer.appendChild(tab);
+        }
+
+        function createTabContent(channelId, isActive = false) {
+            const contentsContainer = document.getElementById('tab-contents');
+            const content = document.createElement('div');
+            content.className = `tab-content ${isActive ? 'active' : ''}`;
+            content.setAttribute('data-channel', channelId);
+            
+            content.innerHTML = `
+                <div class="messages" id="messages-${channelId}">
+                    <div style="text-align: center; color: #72767d; padding: 20px;" data-waiting>
+                        Aguardando mensagens${channelId !== 'all' ? ` do canal ${channels.get(channelId)?.name || channelId}` : ''}...
+                    </div>
+                </div>
+            `;
+            
+            contentsContainer.appendChild(content);
+        }
+
+        function switchTab(channelId) {
+            // Remove classe active de todas as abas
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Remove classe active de todos os conteúdos
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
+            });
+            
+            // Ativa a aba clicada
+            document.querySelector(`[data-channel="${channelId}"]`).classList.add('active');
+            document.querySelector(`.tab-content[data-channel="${channelId}"]`).classList.add('active');
+            
+            activeChannel = channelId;
+            
+            // Auto-scroll na nova aba se ativado
+            if (autoScroll) {
+                const messagesEl = document.getElementById(`messages-${channelId}`);
+                if (messagesEl) {
+                    messagesEl.scrollTop = messagesEl.scrollHeight;
+                }
+            }
+        }
+
+        function updateStatus(status) {
+            const statusEl = document.getElementById('status');
+            if (status === 'connected') {
+                statusEl.className = 'status connected';
+                statusEl.innerHTML = '🟢 Self-bot conectado e enviando dados';
+                lastMessageTime = new Date();
+            } else {
+                statusEl.className = 'status disconnected';
+                statusEl.innerHTML = '🔴 Self-bot desconectado';
+            }
+        }
+
+        function addMessage(data) {
+            // Adiciona mensagem para aba "Todos"
+            addMessageToTab('all', data);
+            
+            // Adiciona mensagem para aba específica do canal se existir
+            const channelId = data.channel_id?.toString();
+            if (channelId && channels.has(channelId)) {
+                addMessageToTab(channelId, data);
+            }
+        }
+
+        function addMessageToTab(channelId, data) {
+            const messagesEl = document.getElementById(`messages-${channelId}`);
+            if (!messagesEl) return;
+            
+            // Remove mensagem de "aguardando" se existir
+            const waitingMsg = messagesEl.querySelector('[data-waiting]');
+            if (waitingMsg) {
+                waitingMsg.remove();
+            }
+
+            const messageEl = document.createElement('div');
+            messageEl.className = 'message';
+            
+            if (data.event_type === 'message_edit') {
+                messageEl.classList.add('edit');
+            } else if (data.event_type === 'message_delete') {
+                messageEl.classList.add('delete');
+            }
+
+            let content = '';
+            if (data.event_type === 'message_edit') {
+                content = `
+                    <div><strong>✏️ EDITADA:</strong></div>
+                    <div><strong>Antes:</strong> ${escapeHtml(data.before_content || 'Vazio')}</div>
+                    <div><strong>Depois:</strong> ${escapeHtml(data.after_content || 'Vazio')}</div>
+                `;
+            } else if (data.event_type === 'message_delete') {
+                content = `<div><strong>🗑️ DELETADA:</strong> ${escapeHtml(data.deleted_content || 'Sem conteúdo')}</div>`;
+            } else {
+                content = escapeHtml(data.content || 'Sem conteúdo de texto');
+                if (data.attachments && data.attachments.length > 0) {
+                    content += `<br><strong>📎 Anexos:</strong> ${data.attachments.length}`;
+                }
+            }
+
+            const timestamp = new Date(data.timestamp).toLocaleString('pt-BR');
+            
+            messageEl.innerHTML = `
+                <div class="message-header">
+                    <span class="guild-info">${escapeHtml(data.guild_name)} → #${escapeHtml(data.channel_name)}</span>
+                    <span class="timestamp">${timestamp}</span>
+                </div>
+                <div class="message-content">
+                    <span class="author">${escapeHtml(data.author.display_name || data.author.username)}</span>: ${content}
+                </div>
+            `;
+
+            messagesEl.appendChild(messageEl);
+
+            // Armazena mensagem no histórico do canal
+            if (!messagesByChannel.has(channelId)) {
+                messagesByChannel.set(channelId, []);
+            }
+            messagesByChannel.get(channelId).push(data);
+
+            // Limita o histórico
+            while (messagesEl.children.length > 500) {
+                messagesEl.removeChild(messagesEl.firstChild);
+            }
+            
+            const channelMessages = messagesByChannel.get(channelId);
+            if (channelMessages.length > 500) {
+                channelMessages.shift();
+            }
+
+            // Auto-scroll se ativado e a aba está ativa
+            if (autoScroll && activeChannel === channelId) {
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function clearMessages() {
+            // Limpa mensagens de todas as abas
+            channels.forEach((channel, channelId) => {
+                const messagesEl = document.getElementById(`messages-${channelId}`);
+                if (messagesEl) {
+                    messagesEl.innerHTML = `<div style="text-align: center; color: #72767d; padding: 20px;" data-waiting>Aguardando mensagens${channelId !== 'all' ? ` do canal ${channel.name || channelId}` : ''}...</div>`;
+                }
+                messagesByChannel.set(channelId, []);
+            });
+        }
+
+        function toggleAutoScroll() {
+            autoScroll = !autoScroll;
+            document.getElementById('autoscroll-status').textContent = autoScroll ? 'ON' : 'OFF';
+        }
+
+        // Verifica se ainda está recebendo mensagens
+        setInterval(function() {
+            if (lastMessageTime && (new Date() - lastMessageTime) > 30000) {
+                updateStatus('disconnected');
+                lastMessageTime = null;
+            }
+        }, 10000);
+    </script>
+</body>
+</html>
