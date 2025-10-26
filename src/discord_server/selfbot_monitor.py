@@ -1,15 +1,3 @@
-"""
-Discord Self-Bot Monitor - APENAS PARA FINS ACADÊMICOS
-=====================================================
-
-AVISO IMPORTANTE:
-- Self-bots violam os Termos de Serviço do Discord
-- Usar este código pode resultar no banimento da sua conta
-- Este código é apenas para fins educacionais e de pesquisa
-
-Este script monitora mensagens em canais do Discord e as transmite
-para um servidor HTTP local.
-"""
 import os
 
 import sys
@@ -210,8 +198,8 @@ def main():
         dc_keys = json.load(f)
 
     TOKEN_DC = dc_keys["TOKEN_DC"]
-    CHANNEL_1 = dc_keys["CHANNEL_1"]
-    CHANNEL_2 = dc_keys["CHANNEL_2"]
+    CHANNEL_1 = dc_keys["SOURCE_CHANNEL_ID_1"]
+    CHANNEL_2 = dc_keys["SOURCE_CHANNEL_ID_2"]
 
     # CONFIGURAÇÕES - EDITE AQUI
     TOKEN = f"{TOKEN_DC}"  # ⚠️ NUNCA COMPARTILHE SEU TOKEN

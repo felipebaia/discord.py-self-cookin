@@ -65,7 +65,7 @@ monitored_channels = load_channel_config()
 
 
 # Template HTML para interface web
-with open('src/html/template.html', 'r', encoding='utf-8') as f:
+with open('src/web_page/html/template.html', 'r', encoding='utf-8') as f:
     HTML_TEMPLATE = f.read()
 
 @app.route('/')
