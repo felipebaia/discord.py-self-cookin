@@ -7,7 +7,6 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-import io
 
 import aiohttp
 
@@ -100,14 +99,12 @@ class ChannelRelay(discord.Client):
 
         self._polling_task: Optional[asyncio.Task[None]] = None
         self._http_session: Optional[aiohttp.ClientSession] = None
-        self._webhook: Optional[discord.Webhook] = None
 
         self._source_channel: Optional[discord.TextChannel] = None
         self._last_message_id: Optional[int] = self.state_store.load_last_message_id()
 
     async def setup_hook(self) -> None:
         self._http_session = aiohttp.ClientSession()
-        self._webhook = discord.Webhook.from_url(self.config.webhook_url, session=self._http_session)
         self._polling_task = asyncio.create_task(self._poll_loop())
         logger.info("Webhook inicializado e rotina agendada")
 
@@ -195,48 +192,104 @@ class ChannelRelay(discord.Client):
 
         logger.info("%s mensagens replicadas do canal %s", len(new_messages), channel.id)
 
+    @staticmethod
+    def _should_forward_attachment(attachment: discord.Attachment) -> bool:
+        content_type = (attachment.content_type or "").lower()
+        if content_type.startswith("image/gif"):
+            return False
+        if content_type.startswith("image/"):
+            return True
+
+        filename = attachment.filename.lower()
+        if filename.endswith(".gif"):
+            return False
+
+        image_suffixes = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")
+        return filename.endswith(image_suffixes)
+
     async def _forward_message(self, message: discord.Message) -> None:
         if message.author.id == getattr(self.user, "id", None):
             return
 
-        if not self._webhook:
-            raise RuntimeError("Webhook não inicializado")
+        if not self._http_session:
+            raise RuntimeError("Sessão HTTP não inicializada")
 
-        files: list[discord.File] = []
+        files: list[tuple[str, bytes, Optional[str]]] = []
         for attachment in message.attachments:
+            if not self._should_forward_attachment(attachment):
+                logger.debug("Ignorando anexo %s (não é imagem suportada)", attachment.filename)
+                continue
+
             try:
-                payload = await attachment.read()
-                buffer = io.BytesIO(payload)
-                buffer.seek(0)
-                files.append(discord.File(buffer, filename=attachment.filename))
+                file_bytes = await attachment.read()
+                files.append((attachment.filename, file_bytes, attachment.content_type))
             except Exception as exc:
                 logger.exception("Falha ao preparar anexo %s: %s", attachment.filename, exc)
 
         embeds = [discord.Embed.from_dict(embed.to_dict()) for embed in message.embeds]
 
-        send_kwargs = {
+        payload: dict[str, Any] = {
             "username": message.author.display_name,
             "avatar_url": getattr(message.author.display_avatar, "url", None),
-            "allowed_mentions": discord.AllowedMentions.none(),
-            "wait": True,
+            "allowed_mentions": {"parse": []},
         }
 
         if message.content:
-            send_kwargs["content"] = message.content
+            payload["content"] = message.content
 
         if embeds:
-            send_kwargs["embeds"] = embeds
+            payload["embeds"] = [embed.to_dict() for embed in embeds]
 
         if files:
-            send_kwargs["files"] = files
+            payload["attachments"] = [
+                {"id": index, "filename": filename}
+                for index, (filename, _, _) in enumerate(files)
+            ]
 
         try:
-            await self._webhook.send(**send_kwargs)
+            await self._dispatch_via_webhook(payload, files)
         except Exception as exc:
             logger.exception("Erro ao enviar mensagem para o webhook: %s", exc)
-        finally:
-            for file in files:
-                file.close()
+
+    async def _dispatch_via_webhook(
+        self,
+        payload: dict[str, Any],
+        files: list[tuple[str, bytes, Optional[str]]],
+    ) -> None:
+        if not self._http_session:
+            raise RuntimeError("Sessão HTTP não inicializada")
+
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        if files:
+            form = aiohttp.FormData()
+            form.add_field("payload_json", json.dumps(payload), content_type="application/json")
+
+            for index, (filename, data_bytes, content_type) in enumerate(files):
+                form.add_field(
+                    name=f"files[{index}]",
+                    value=data_bytes,
+                    filename=filename,
+                    content_type=content_type or "application/octet-stream",
+                )
+
+            async with self._http_session.post(
+                self.config.webhook_url,
+                data=form,
+                timeout=timeout,
+            ) as response:
+                if response.status >= 400:
+                    body = await response.text()
+                    raise RuntimeError(f"Webhook retornou {response.status}: {body}")
+        else:
+            async with self._http_session.post(
+                self.config.webhook_url,
+                json=payload,
+                timeout=timeout,
+            ) as response:
+                if response.status >= 400:
+                    body = await response.text()
+                    raise RuntimeError(f"Webhook retornou {response.status}: {body}")
 
 
 def main() -> None:
