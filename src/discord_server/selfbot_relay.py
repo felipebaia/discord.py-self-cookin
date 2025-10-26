@@ -34,9 +34,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RelayConfig:
     token: str
-    source_channel_id: int
-    target_channel_id: int
-    webhook_url: str
+    channel_webhooks: dict[int, list[str]]
 
     @classmethod
     def load_from_json(cls, path: Path) -> "RelayConfig":
@@ -47,36 +45,94 @@ class RelayConfig:
             raw_config = json.load(fp)
 
         try:
-            return cls(
-                token=raw_config["TOKEN_DC"],
-                source_channel_id=int(raw_config["SOURCE_CHANNEL_ID_1"]),
-                target_channel_id=int(raw_config["TARGET_CHANNEL_ID_1"]),
-                webhook_url=str(raw_config["WEBHOOK"])
-            )
+            token = raw_config["TOKEN_DC"]
         except KeyError as exc:
-            raise KeyError(f"Chave obrigatória não encontrada no JSON: {exc}") from exc
+            raise KeyError("TOKEN_DC não encontrado no arquivo de configuração") from exc
+
+        channel_webhooks: dict[int, list[str]] = {}
+        index = 1
+        while True:
+            source_key = f"SOURCE_CHANNEL_ID_{index}"
+            webhook_key = f"WEBHOOK_{index}"
+
+            source_present = source_key in raw_config
+            webhook_present = webhook_key in raw_config
+
+            if not source_present and not webhook_present:
+                break
+
+            if not source_present or not webhook_present:
+                raise KeyError(f"Par de configuração incompleto: {source_key} / {webhook_key}")
+
+            channel_id = int(raw_config[source_key])
+            webhook_url = str(raw_config[webhook_key])
+
+            if not webhook_url:
+                raise ValueError(f"Webhook vazio para {webhook_key}")
+
+            channel_webhooks.setdefault(channel_id, []).append(webhook_url)
+            index += 1
+
+        if not channel_webhooks:
+            raise ValueError("Nenhum canal foi configurado para replicação")
+
+        return cls(token=token, channel_webhooks=channel_webhooks)
 
 
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._state: dict[int, int] = self._load_state()
 
-    def load_last_message_id(self) -> Optional[int]:
+    def _load_state(self) -> dict[int, int]:
         if not self.path.exists():
-            return None
+            return {}
 
         try:
             with self.path.open("r", encoding="utf-8") as fp:
                 data = json.load(fp)
-            return int(data.get("last_message_id")) if data.get("last_message_id") else None
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, OSError):
             logger.warning("Estado inválido encontrado, iniciando sem histórico")
-            return None
+            return {}
 
-    def save_last_message_id(self, message_id: int) -> None:
+        if isinstance(data, dict):
+            # Formato novo preferencial
+            channels = data.get("channels")
+            if isinstance(channels, dict):
+                result: dict[int, int] = {}
+                for key, value in channels.items():
+                    try:
+                        channel_id = int(key)
+                        message_id = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    result[channel_id] = message_id
+                return result
+
+            # Compatibilidade com formato antigo (valor único)
+            raw_single = data.get("last_message_id")
+            try:
+                single_value = int(raw_single) if raw_single is not None else None
+            except (TypeError, ValueError):
+                single_value = None
+            if single_value:
+                logger.info("Convertendo estado antigo para o formato multi-canal")
+                return {-1: single_value}
+
+        return {}
+
+    def load_last_message_id(self, channel_id: int) -> Optional[int]:
+        return self._state.get(channel_id)
+
+    def save_last_message_id(self, channel_id: int, message_id: int) -> None:
+        self._state[channel_id] = message_id
+        self._persist()
+
+    def _persist(self) -> None:
         temp_path = self.path.with_suffix(".tmp")
+        payload = {"channels": {str(cid): mid for cid, mid in self._state.items() if cid >= 0}}
         with temp_path.open("w", encoding="utf-8") as fp:
-            json.dump({"last_message_id": message_id}, fp)
+            json.dump(payload, fp)
         temp_path.replace(self.path)
 
 
@@ -99,9 +155,13 @@ class ChannelRelay(discord.Client):
 
         self._polling_task: Optional[asyncio.Task[None]] = None
         self._http_session: Optional[aiohttp.ClientSession] = None
+        self._channel_webhooks = config.channel_webhooks
 
-        self._source_channel: Optional[discord.TextChannel] = None
-        self._last_message_id: Optional[int] = self.state_store.load_last_message_id()
+        self._source_channels: dict[int, discord.TextChannel] = {}
+        self._last_message_ids: dict[int, Optional[int]] = {
+            channel_id: self.state_store.load_last_message_id(channel_id)
+            for channel_id in self._channel_webhooks
+        }
 
     async def setup_hook(self) -> None:
         self._http_session = aiohttp.ClientSession()
@@ -126,18 +186,19 @@ class ChannelRelay(discord.Client):
             getattr(self.user, "id", "N/A")
         )
 
-    async def _ensure_source_channel(self) -> discord.TextChannel:
-        if self._source_channel and self._source_channel.guild:
-            return self._source_channel
+    async def _ensure_source_channel(self, channel_id: int) -> discord.TextChannel:
+        channel = self._source_channels.get(channel_id)
+        if channel and channel.guild:
+            return channel
 
-        channel = self.get_channel(self.config.source_channel_id)
+        channel = self.get_channel(channel_id)
         if channel is None:
-            channel = await self.fetch_channel(self.config.source_channel_id)
+            channel = await self.fetch_channel(channel_id)
 
         if not isinstance(channel, discord.TextChannel):
             raise TypeError("Canal de origem não é um TextChannel")
 
-        self._source_channel = channel
+        self._source_channels[channel_id] = channel
         logger.info(
             "Canal de origem pronto: #%s (%s)",
             getattr(channel, "name", str(channel.id)),
@@ -149,48 +210,60 @@ class ChannelRelay(discord.Client):
         await self.wait_until_ready()
         logger.info("Rotina de polling iniciada; intervalo: %ss", self.poll_interval)
 
-        await self._prime_last_message_id()
+        await self._prime_last_message_ids()
 
         while not self.is_closed():
-            try:
-                await self._collect_and_forward()
-            except Exception as exc:
-                logger.exception("Erro durante o polling: %s", exc)
+            for channel_id, webhook_urls in self._channel_webhooks.items():
+                try:
+                    await self._collect_and_forward(channel_id, webhook_urls)
+                except Exception as exc:
+                    logger.exception("Erro durante o polling do canal %s: %s", channel_id, exc)
             await asyncio.sleep(self.poll_interval)
 
-    async def _prime_last_message_id(self) -> None:
-        if self._last_message_id is not None:
-            return
+    async def _prime_last_message_ids(self) -> None:
+        for channel_id, last_id in list(self._last_message_ids.items()):
+            if last_id is not None:
+                continue
 
-        channel = await self._ensure_source_channel()
-        async for message in channel.history(limit=1):
-            self._last_message_id = message.id
-            self.state_store.save_last_message_id(message.id)
-            logger.info("Iniciado a partir da mensagem %s para evitar duplicações iniciais", message.id)
-            break
+            channel = await self._ensure_source_channel(channel_id)
+            async for message in channel.history(limit=1):
+                self._last_message_ids[channel_id] = message.id
+                self.state_store.save_last_message_id(channel_id, message.id)
+                logger.info(
+                    "Iniciado canal %s a partir da mensagem %s para evitar duplicações iniciais",
+                    channel_id,
+                    message.id,
+                )
+                break
 
-    async def _collect_and_forward(self) -> None:
-        channel = await self._ensure_source_channel()
+    async def _collect_and_forward(self, channel_id: int, webhook_urls: list[str]) -> None:
+        channel = await self._ensure_source_channel(channel_id)
 
         history_kwargs = {
             "limit": 100,
             "oldest_first": True,
         }
-        if self._last_message_id:
-            history_kwargs["after"] = discord.Object(id=self._last_message_id)
+        last_message_id = self._last_message_ids.get(channel_id)
+        if last_message_id:
+            history_kwargs["after"] = discord.Object(id=last_message_id)
 
         new_messages = [message async for message in channel.history(**history_kwargs)]
 
         if not new_messages:
-            logger.debug("Nenhuma mensagem nova encontrada")
+            logger.debug("Nenhuma mensagem nova encontrada para o canal %s", channel_id)
             return
 
         for message in new_messages:
-            await self._forward_message(message)
-            self._last_message_id = message.id
-            self.state_store.save_last_message_id(message.id)
+            await self._forward_message(message, webhook_urls)
+            self._last_message_ids[channel_id] = message.id
+            self.state_store.save_last_message_id(channel_id, message.id)
 
-        logger.info("%s mensagens replicadas do canal %s", len(new_messages), channel.id)
+        logger.info(
+            "%s mensagens replicadas do canal %s para %s webhook(s)",
+            len(new_messages),
+            channel_id,
+            len(webhook_urls),
+        )
 
     @staticmethod
     def _should_forward_attachment(attachment: discord.Attachment) -> bool:
@@ -207,7 +280,7 @@ class ChannelRelay(discord.Client):
         image_suffixes = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")
         return filename.endswith(image_suffixes)
 
-    async def _forward_message(self, message: discord.Message) -> None:
+    async def _forward_message(self, message: discord.Message, webhook_urls: list[str]) -> None:
         if message.author.id == getattr(self.user, "id", None):
             return
 
@@ -246,13 +319,15 @@ class ChannelRelay(discord.Client):
                 for index, (filename, _, _) in enumerate(files)
             ]
 
-        try:
-            await self._dispatch_via_webhook(payload, files)
-        except Exception as exc:
-            logger.exception("Erro ao enviar mensagem para o webhook: %s", exc)
+        for webhook_url in webhook_urls:
+            try:
+                await self._dispatch_via_webhook(webhook_url, payload, files)
+            except Exception as exc:
+                logger.exception("Erro ao enviar mensagem para o webhook %s: %s", webhook_url, exc)
 
     async def _dispatch_via_webhook(
         self,
+        webhook_url: str,
         payload: dict[str, Any],
         files: list[tuple[str, bytes, Optional[str]]],
     ) -> None:
@@ -274,7 +349,7 @@ class ChannelRelay(discord.Client):
                 )
 
             async with self._http_session.post(
-                self.config.webhook_url,
+                webhook_url,
                 data=form,
                 timeout=timeout,
             ) as response:
@@ -283,7 +358,7 @@ class ChannelRelay(discord.Client):
                     raise RuntimeError(f"Webhook retornou {response.status}: {body}")
         else:
             async with self._http_session.post(
-                self.config.webhook_url,
+                webhook_url,
                 json=payload,
                 timeout=timeout,
             ) as response:
