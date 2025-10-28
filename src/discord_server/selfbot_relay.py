@@ -32,9 +32,16 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class RelayTarget:
+    webhook_url: str
+    caller_name: str
+    avatar_url: str
+
+
+@dataclass
 class RelayConfig:
     token: str
-    channel_webhooks: dict[int, list[str]]
+    channel_targets: dict[int, list[RelayTarget]]
 
     @classmethod
     def load_from_json(cls, path: Path) -> "RelayConfig":
@@ -49,34 +56,48 @@ class RelayConfig:
         except KeyError as exc:
             raise KeyError("TOKEN_DC não encontrado no arquivo de configuração") from exc
 
-        channel_webhooks: dict[int, list[str]] = {}
+        channel_targets: dict[int, list[RelayTarget]] = {}
         index = 1
         while True:
             source_key = f"SOURCE_CHANNEL_ID_{index}"
             webhook_key = f"WEBHOOK_{index}"
+            caller_key = f"CALLER_NAME_{index}"
+            pfp_key = f"PFP_{index}"
 
             source_present = source_key in raw_config
             webhook_present = webhook_key in raw_config
+            caller_present = caller_key in raw_config
+            pfp_present = pfp_key in raw_config
 
-            if not source_present and not webhook_present:
+            if not source_present and not webhook_present and not caller_present and not pfp_present:
                 break
 
-            if not source_present or not webhook_present:
-                raise KeyError(f"Par de configuração incompleto: {source_key} / {webhook_key}")
+            if not source_present or not webhook_present or not caller_present or not pfp_present:
+                raise KeyError(
+                    f"Par de configuração incompleto: {source_key} / {webhook_key} / {caller_key} / {pfp_key}"
+                )
 
             channel_id = int(raw_config[source_key])
             webhook_url = str(raw_config[webhook_key])
+            caller_name = str(raw_config[caller_key]).strip()
+            avatar_url = str(raw_config[pfp_key]).strip()
 
             if not webhook_url:
                 raise ValueError(f"Webhook vazio para {webhook_key}")
+            if not caller_name:
+                raise ValueError(f"Caller name vazio para {caller_key}")
+            if not avatar_url:
+                raise ValueError(f"Avatar URL vazio para {pfp_key}")
 
-            channel_webhooks.setdefault(channel_id, []).append(webhook_url)
+            channel_targets.setdefault(channel_id, []).append(
+                RelayTarget(webhook_url, caller_name, avatar_url)
+            )
             index += 1
 
-        if not channel_webhooks:
+        if not channel_targets:
             raise ValueError("Nenhum canal foi configurado para replicação")
 
-        return cls(token=token, channel_webhooks=channel_webhooks)
+        return cls(token=token, channel_targets=channel_targets)
 
 
 class StateStore:
@@ -137,7 +158,7 @@ class StateStore:
 
 
 class ChannelRelay(discord.Client):
-    def __init__(self, config: RelayConfig, state_store: StateStore, poll_interval: int = 20) -> None:
+    def __init__(self, config: RelayConfig, state_store: StateStore, poll_interval: int = 720) -> None:
         intents_kwargs: dict[str, Any] = {}
         intents_cls = getattr(discord, "Intents", None)
         if intents_cls is not None:
@@ -155,12 +176,12 @@ class ChannelRelay(discord.Client):
 
         self._polling_task: Optional[asyncio.Task[None]] = None
         self._http_session: Optional[aiohttp.ClientSession] = None
-        self._channel_webhooks = config.channel_webhooks
+        self._channel_targets = config.channel_targets
 
         self._source_channels: dict[int, discord.TextChannel] = {}
         self._last_message_ids: dict[int, Optional[int]] = {
             channel_id: self.state_store.load_last_message_id(channel_id)
-            for channel_id in self._channel_webhooks
+            for channel_id in self._channel_targets
         }
 
     async def setup_hook(self) -> None:
@@ -213,9 +234,9 @@ class ChannelRelay(discord.Client):
         await self._prime_last_message_ids()
 
         while not self.is_closed():
-            for channel_id, webhook_urls in self._channel_webhooks.items():
+            for channel_id, targets in self._channel_targets.items():
                 try:
-                    await self._collect_and_forward(channel_id, webhook_urls)
+                    await self._collect_and_forward(channel_id, targets)
                 except Exception as exc:
                     logger.exception("Erro durante o polling do canal %s: %s", channel_id, exc)
             await asyncio.sleep(self.poll_interval)
@@ -236,7 +257,7 @@ class ChannelRelay(discord.Client):
                 )
                 break
 
-    async def _collect_and_forward(self, channel_id: int, webhook_urls: list[str]) -> None:
+    async def _collect_and_forward(self, channel_id: int, targets: list[RelayTarget]) -> None:
         channel = await self._ensure_source_channel(channel_id)
 
         history_kwargs = {
@@ -254,7 +275,7 @@ class ChannelRelay(discord.Client):
             return
 
         for message in new_messages:
-            await self._forward_message(message, webhook_urls)
+            await self._forward_message(message, targets)
             self._last_message_ids[channel_id] = message.id
             self.state_store.save_last_message_id(channel_id, message.id)
 
@@ -262,7 +283,7 @@ class ChannelRelay(discord.Client):
             "%s mensagens replicadas do canal %s para %s webhook(s)",
             len(new_messages),
             channel_id,
-            len(webhook_urls),
+            len(targets),
         )
 
     @staticmethod
@@ -280,7 +301,7 @@ class ChannelRelay(discord.Client):
         image_suffixes = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")
         return filename.endswith(image_suffixes)
 
-    async def _forward_message(self, message: discord.Message, webhook_urls: list[str]) -> None:
+    async def _forward_message(self, message: discord.Message, targets: list[RelayTarget]) -> None:
         if message.author.id == getattr(self.user, "id", None):
             return
 
@@ -302,8 +323,6 @@ class ChannelRelay(discord.Client):
         embeds = [discord.Embed.from_dict(embed.to_dict()) for embed in message.embeds]
 
         payload: dict[str, Any] = {
-            "username": message.author.display_name,
-            "avatar_url": getattr(message.author.display_avatar, "url", None),
             "allowed_mentions": {"parse": []},
         }
 
@@ -319,15 +338,23 @@ class ChannelRelay(discord.Client):
                 for index, (filename, _, _) in enumerate(files)
             ]
 
-        for webhook_url in webhook_urls:
+        for target in targets:
             try:
-                await self._dispatch_via_webhook(webhook_url, payload, files)
+                await self._dispatch_via_webhook(
+                    target.webhook_url,
+                    target.caller_name,
+                    target.avatar_url,
+                    payload,
+                    files,
+                )
             except Exception as exc:
-                logger.exception("Erro ao enviar mensagem para o webhook %s: %s", webhook_url, exc)
+                logger.exception("Erro ao enviar mensagem para o webhook %s: %s", target.webhook_url, exc)
 
     async def _dispatch_via_webhook(
         self,
         webhook_url: str,
+        caller_name: str,
+        avatar_url: str,
         payload: dict[str, Any],
         files: list[tuple[str, bytes, Optional[str]]],
     ) -> None:
@@ -336,9 +363,13 @@ class ChannelRelay(discord.Client):
 
         timeout = aiohttp.ClientTimeout(total=30)
 
+        final_payload = dict(payload)
+        final_payload["username"] = caller_name
+        final_payload["avatar_url"] = avatar_url
+
         if files:
             form = aiohttp.FormData()
-            form.add_field("payload_json", json.dumps(payload), content_type="application/json")
+            form.add_field("payload_json", json.dumps(final_payload), content_type="application/json")
 
             for index, (filename, data_bytes, content_type) in enumerate(files):
                 form.add_field(
@@ -359,7 +390,7 @@ class ChannelRelay(discord.Client):
         else:
             async with self._http_session.post(
                 webhook_url,
-                json=payload,
+                json=final_payload,
                 timeout=timeout,
             ) as response:
                 if response.status >= 400:
