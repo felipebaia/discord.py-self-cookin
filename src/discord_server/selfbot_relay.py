@@ -10,14 +10,17 @@ from typing import Any, Optional
 
 import aiohttp
 
-import sys
-sys.path.append("/home/baia/git/discord.py-self-cookin/")
-import discord
+import random
+import time
 
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent.parent
 CONFIG_PATH = ROOT_DIR / ".local_keys" / "dc_keys.json"
 STATE_PATH = BASE_DIR / "selfbot_relay_state.json"
+
+import sys
+sys.path.append(str(ROOT_DIR))
+import discord
 
 LOG_PATH = BASE_DIR / "selfbot_relay.log"
 logging.basicConfig(
@@ -398,6 +401,46 @@ class ChannelRelay(discord.Client):
                     raise RuntimeError(f"Webhook retornou {response.status}: {body}")
 
 
+def run_relay_forever(
+    config: RelayConfig,
+    state_store: StateStore,
+    poll_interval: int = 720,
+    base_delay: int = 30,
+    max_delay: int = 900,
+) -> None:
+    attempt = 0
+
+    while True or attempt > 20:
+        attempt += 1
+        relay = ChannelRelay(config, state_store, poll_interval=poll_interval)
+        logger.info("Iniciando instância do relay (tentativa %s)", attempt)
+
+        try:
+            relay.run(config.token, reconnect=True)
+            logger.info("Instância do relay finalizada sem erro explícito; encerrando controlador")
+            return
+        except discord.LoginFailure:
+            logger.error("Falha na autenticação. Verifique o token fornecido.")
+            return
+        except KeyboardInterrupt:
+            logger.info("Interrupção solicitada pelo usuário.")
+            return
+        except Exception:
+            logger.exception("Erro fatal na execução do relay (tentativa %s)", attempt)
+
+        try:
+            if relay.loop and not relay.loop.is_closed():
+                relay.loop.run_until_complete(relay.close())
+        except Exception:
+            logger.debug("Falha ao fechar instância do relay durante reinício", exc_info=True)
+
+        delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+        jitter = delay * 0.15
+        sleep_for = max(5.0, delay + random.uniform(-jitter, jitter))
+        logger.info("Tentando reiniciar relay em %.1f segundos", sleep_for)
+        time.sleep(sleep_for)
+
+
 def main() -> None:
     try:
         config = RelayConfig.load_from_json(CONFIG_PATH)
@@ -410,18 +453,8 @@ def main() -> None:
         return
 
     state_store = StateStore(STATE_PATH)
-    relay = ChannelRelay(config, state_store)
-
-    try:
-        relay.run(config.token)
-    except discord.LoginFailure:
-        logger.error("Falha na autenticação. Verifique o token fornecido.")
-    except KeyboardInterrupt:
-        logger.info("Interrupção solicitada pelo usuário.")
-    except Exception as exc:
-        logger.exception("Erro fatal na execução do relay: %s", exc)
-    finally:
-        logger.info("Relay encerrado")
+    run_relay_forever(config, state_store)
+    logger.info("Relay encerrado")
 
 
 if __name__ == "__main__":
